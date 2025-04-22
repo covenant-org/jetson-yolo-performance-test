@@ -6,13 +6,15 @@ from multiprocessing import Process, Event, Value
 
 TRACKING_URI = "https://mlflow.nuclea.solutions"
 
-def avg_gpu_usg(event, result):
+def avg_gpu_usg(event, result, max_gpu):
     from jtop import jtop
     sample_count=0
     total=0
     with jtop() as jetson:
         while jetson.ok() and not event.is_set():
             if jetson.stats['GPU'] > 0:
+                if jetson.stats['GPU'] > max_gpu.value:
+                    max_gpu.value = jetson.stats['GPU']
                 sample_count+=1
                 total += jetson.stats['GPU']
     result.value=total/sample_count
@@ -28,6 +30,7 @@ class TestFPSResult:
         self.experiment_name = ""
         self.run_name = ""
         self.avg_gpu_usage = 0
+        self.max_gpu_usage = 0
         self.url = ""
 
 
@@ -82,7 +85,8 @@ def test_model(model_path, video_path):
     total_fps = 0
     finish_gpu_monitor = Event()
     gpu_usage = Value('d', 0.0)
-    gpu_monitor = Process(target=avg_gpu_usg, args=(finish_gpu_monitor,gpu_usage))
+    gpu_max_usage = Value('d', 0.0)
+    gpu_monitor = Process(target=avg_gpu_usg, args=(finish_gpu_monitor,gpu_usage, gpu_max_usage))
     gpu_monitor.start()
     while True:
         start_time = time.time()
@@ -102,18 +106,19 @@ def test_model(model_path, video_path):
     results.time_end = time.time()
     gpu_monitor.join()
     results.avg_gpu_usage = gpu_usage.value
+    results.max_gpu_usage = gpu_max_usage.value
     results.avg_fps = total_fps / results.frame_count
     results.time_elapsed = results.time_end - results.time_start
     video.release()
-    print(f"{color.GREEN}SUCCESS: FPS: {results.avg_fps} GPU: {results.avg_gpu_usage.value}{color.END}")
+    print(f"{color.GREEN}SUCCESS: FPS: {results.avg_fps} GPU: {results.avg_gpu_usage}{color.END}")
     return results
 
 
 def save_to_csv(result: TestFPSResult, output_file):
     output_file.write(
-        f"{result.experiment_name},{result.run_name},{result.avg_fps},{result.frame_count},{result.time_elapsed},{result.avg_gpu_usage},{result.url}\n")
+        f"{result.experiment_name},{result.run_name},{result.avg_fps},{result.frame_count},{result.time_elapsed},{result.avg_gpu_usage},{result.max_gpu_usage},{result.url}\n")
 
-def download_model(client, experiment, run):
+def download_model(client, path_to_model, experiment, run):
     print(
         f"{color.YELLOW}Downloading model from run {run.info.run_name}{color.END}")
     client.download_artifacts(run_id=run.info.run_id, path=f"weights/best.pt",
@@ -128,7 +133,7 @@ def main():
     mlflow.set_tracking_uri(TRACKING_URI)
     client = mlflow.client.MlflowClient(TRACKING_URI)
     output_file = open(args.output, "w")
-    output_file.write("Experiment,Run,Avg FPS,Frames,Time Elapsed,GPU Usage,MLFLOW URL\n")
+    output_file.write("Experiment,Run,Avg FPS,Frames,Time Elapsed,Avg GPU Usage,Max GPU Usage,MLFLOW URL\n")
     for experiment in args.experiments:
         print(f"{color.BOLD}Searching runs from experiment {experiment}{color.END}")
         experiment = client.get_experiment_by_name(experiment)
@@ -142,7 +147,7 @@ def main():
                 print(
                     f"{color.GRAY}Model {run.info.run_name} already exists{color.END}")
             else:
-                download_model(client, experiment, run)
+                download_model(client, path_to_model, experiment, run)
 
             print(f"{color.CYAN}Running model {run.info.run_name}{color.END}")
             result = test_model(path_to_model, args.video)
@@ -152,7 +157,6 @@ def main():
             result.experiment_name = experiment.name
             result.run_name = run.info.run_name
             result.url = f"{TRACKING_URI}/#/experiments/{experiment.experiment_id}/runs/{run.info.run_id}"
-            print(f"{result=}")
             save_to_csv(result, output_file)
         print("")
     output_file.close()
